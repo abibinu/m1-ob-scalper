@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import pandas as pd
 
 import optuna
 from dotenv import load_dotenv
@@ -11,14 +12,14 @@ import MetaTrader5 as mt5
 
 load_dotenv()
 
-def objective(trial, symbol, bars):
+def objective(trial, symbol: str, bars: pd.DataFrame) -> float:
     # Hyperparameter search space
     r_multiple = trial.suggest_float("r_multiple", 1.0, 4.0, step=0.1)
     sl_spread_buffer = trial.suggest_float("sl_spread_buffer", 1.0, 3.0, step=0.1)
     breakeven_at_r = trial.suggest_float("breakeven_at_r", 0.0, 2.0, step=0.1)
     max_hold_bars = trial.suggest_int("max_hold_bars", 15, 120, step=5)
     max_ob_age_bars = trial.suggest_int("max_ob_age_bars", 30, 150, step=5)
-    displacement_threshold = trial.suggest_float("displacement_threshold", 1.0, 2.5, step=0.1)
+    displacement_threshold = trial.suggest_float("displacement_threshold", 0.8, 2.5, step=0.1)
     
     # Trailing Stop
     use_trailing = trial.suggest_categorical("use_trailing", [True, False])
@@ -48,7 +49,7 @@ def objective(trial, symbol, bars):
     report = engine.run()
     
     # Penalize if very few trades are taken
-    if report.total_trades < 20:
+    if report.total_trades < 15:
         return -100.0  # Heavy penalty for low trade count
         
     # Custom score: Total R multiplied by a logarithmic trade frequency modifier.
@@ -100,9 +101,12 @@ def main():
     
     best = study.best_trial
     print(f"Best Score (Total R): {best.value:.2f}")
-    print(f"  Trades        : {best.user_attrs.get('trades')}")
-    print(f"  Win Rate      : {best.user_attrs.get('win_rate'):.1%}")
-    print(f"  Profit Factor : {best.user_attrs.get('profit_factor'):.2f}")
+    if best.value == -100.0 or not best.user_attrs:
+        print("  Trades        : None (All trials failed the minimum trade limit)")
+    else:
+        print(f"  Trades        : {best.user_attrs.get('trades')}")
+        print(f"  Win Rate      : {best.user_attrs.get('win_rate'):.1%}")
+        print(f"  Profit Factor : {best.user_attrs.get('profit_factor'):.2f}")
     
     print("\nBest Parameters to put in your .env file:")
     for k, v in best.params.items():
