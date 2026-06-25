@@ -1,0 +1,126 @@
+[Unknown] System Design Document
+[Unknown] Automated M1 Order Block Scalping System
+[Unknown] Revision 2 — Expanded Specification
+[Unknown] Platform: MetaTrader 5 (Python API) · Broker: Vantage (Demo Server)
+[Unknown] What changed in this revision
+[List Paragraph] Added explicit exit logic (Module 4) — stop-loss, take-profit, and trailing rules
+[List Paragraph] Added Order Block lifecycle rules (Module 3) — age limits, invalidation, stacking
+[List Paragraph] Added execution-quality filters (Module 4) — spread, session, news blackout, latency budget
+[List Paragraph] Clarified backtest engine to be bar-by-bar (event-driven), not vectorized, to avoid lookahead bias
+[List Paragraph] Added Module 6: Validation & Deployment Gate — walk-forward testing and demo-to-live criteria
+[Heading 1] Table of Contents
+[Heading 1] 1. Document Overview
+[Unknown] This document establishes the technical specifications and system architecture for an automated high-frequency scalping bot utilizing the MetaTrader 5 (MT5) Python API interface connected to a Vantage demo server. The strategy relies exclusively on 1-minute market structure shifts and order block rejections, validated through an event-driven backtesting engine prior to any live or demo deployment.
+[Unknown] This revision expands the original design with explicit exit logic, order block lifecycle management, execution-quality filtering, and a formal validation gate between backtesting and demo trading. These additions close the gaps that most commonly cause backtested strategies to underperform or fail outright in live conditions.
+[Heading 2] 1.1 Scope
+[Unknown] The system covers six modules: connection management, market data ingestion, strategy signal generation, execution and risk management, backtesting, and validation/deployment gating. It does not cover portfolio-level multi-strategy allocation, which is out of scope for this revision.
+[Heading 2] 1.2 Definitions
+[Heading 1] 2. Module 1: Core Engine & Connection Manager
+[Unknown] The system entry point handles authentication states, runtime connection tracking, and graceful exit routines during abnormal network degradation.
+[List Paragraph] API Ingestion: Connects directly via MetaTrader5 Python wrapper libraries.
+[List Paragraph] Credential Router: Stores Vantage server connection definitions securely and initializes connection states via mt5.login() loops.
+[List Paragraph] Network Interceptor: Contains an active exception handler that monitors communication latency. If terminal drop-out occurs, it halts execution pipelines and falls back to safe mode.
+[Heading 2] 2.1 Reconnection Policy (New)
+[Unknown] The original spec halts on disconnect but does not define recovery behavior. This revision adds:
+[List Paragraph] Exponential backoff reconnect: Retry mt5.login() at 2s, 4s, 8s, 16s, 30s intervals, capped at 30s between attempts.
+[List Paragraph] Position reconciliation on reconnect: Before resuming signal generation, query mt5.positions_get() and mt5.orders_get() to reconcile internal state against the broker's actual book — a dropped connection mid-trade must not result in an orphaned or duplicated position.
+[List Paragraph] Max retry ceiling: After 10 consecutive failed reconnect attempts (~5 minutes), the system enters a hard-stop state requiring manual restart, rather than retrying indefinitely.
+[Unknown] Revision note: Credential storage should use environment variables or an OS-level secrets manager, not plaintext config files committed to source control.
+[Heading 1] 3. Module 2: Market Data Layer
+[Unknown] Manages the structural data conversion pipeline for high-frequency algorithmic scanning.
+[Heading 2] 3.1 Data Integrity Checks (New)
+[Unknown] Live data feeds occasionally produce gaps, duplicate timestamps, or zero-volume bars (e.g., around broker maintenance windows). The data layer should validate each incoming bar before it reaches the strategy processor:
+[List Paragraph] Reject or flag bars with a timestamp gap greater than 2x the expected M1 interval (i.e., missing bars).
+[List Paragraph] Reject duplicate timestamps (can occur on reconnect) by de-duplicating on the time index.
+[List Paragraph] Flag bars with tick_volume of zero as low-confidence and exclude them from displacement detection.
+[Heading 1] 4. Module 3: Algorithmic Strategy Processor
+[Unknown] Operates as an internal state machine monitoring live market structures on the M1 timeframe interval.
+[List Paragraph] Displacement Scanner: Monitors for rapid expansion candle sequences that break past previous structural highs or lows.
+[List Paragraph] Order Block Register: When an expansion breaks structure, the zone of the original counter-candle is cached into memory as an active order block boundary.
+[List Paragraph] Mitigation Sentinel: Evaluates live incoming data frames. If price high/low strikes the cached block coordinate, a signal event is fired.
+[Heading 2] 4.1 Order Block Lifecycle Rules (New)
+[Unknown] The original spec caches an order block indefinitely once registered. Untracked, stale order blocks accumulate and generate low-quality signals far from the original displacement. This revision adds explicit lifecycle rules:
+[Heading 3] 4.1.1 Validity Window
+[List Paragraph] An order block expires and is removed from the active register if not mitigated within N bars (configurable; suggested default 50–100 M1 bars, roughly 1–2 hours). Older zones have materially lower reaction probability.
+[Heading 3] 4.1.2 Invalidation Conditions
+[List Paragraph] A close (not just a wick) through the far boundary of the order block without reaction invalidates it immediately, regardless of age.
+[List Paragraph] An order block is invalidated if a stronger, more recent displacement creates a new structural break in the same direction — the newer block takes precedence.
+[Heading 3] 4.1.3 Stacking & Overlap
+[List Paragraph] When multiple unmitigated order blocks overlap or stack within a defined price tolerance (e.g., 1.5x average spread), they are merged into a single zone using the outermost boundaries, rather than treated as independent signals.
+[List Paragraph] The register enforces a maximum count of concurrently tracked order blocks per symbol (suggested default: 5) to bound memory and avoid signal noise from low-quality, distant zones.
+[Heading 3] 4.1.4 Signal Confirmation
+[List Paragraph] A mitigation touch alone is treated as a candidate, not a confirmed signal. Confirmation requires a rejection close back outside the OB zone within the same or next bar — this filters out blocks that get mitigated and simply blown through.
+[Heading 1] 5. Module 4: Execution & Risk Management Engine
+[Unknown] Acts as an internal system firewall designed to protect capital allocations against unexpected tail-risk events.
+[List Paragraph] Account Status Evaluator: Polls live equity balances using mt5.account_info() before compiling any order request arrays.
+[List Paragraph] Mathematical Lot Sizer: Computes the specific volume parameters automatically. Total financial risk is restricted to exactly 0.25% or 0.5% of net equity per transaction.
+[List Paragraph] Daily Loss Interceptor: Keeps track of net daily closed metrics. If daily loss parameters approach or breach the 2% hard risk ceiling, all active order pipelines are immediately shut down.
+[Heading 2] 5.1 Exit Logic (New)
+[Unknown] The original spec defines entry risk sizing but no exit rules. This is the most critical gap to close before any live testing, since exits — not entries — typically determine whether an order-block strategy is profitable.
+[Heading 3] 5.1.1 Stop-Loss Placement
+[List Paragraph] Stop-loss is placed beyond the far boundary of the mitigated order block, plus a buffer of 1–2x current spread to avoid premature stop-outs from noise.
+[Heading 3] 5.1.2 Take-Profit Placement
+[List Paragraph] Primary target: fixed R-multiple (suggested default 1.5R–2R) measured from entry to stop distance.
+[List Paragraph] Secondary/alternative target: nearest opposing liquidity level (prior swing high/low) if it falls short of the R-multiple target, whichever is reached first should close the trade.
+[Heading 3] 5.1.3 Trade Management
+[List Paragraph] Move stop-loss to breakeven once price reaches 1R in favor of the trade (optional, configurable — breakeven stops reduce win rate but cap downside on reversals).
+[List Paragraph] No trailing stop in the initial version — trailing logic on M1 is highly sensitive to spread noise and is deferred to a future revision pending live data.
+[Heading 3] 5.1.4 Time-Based Exit
+[List Paragraph] Any position not resolved (TP/SL) within a maximum hold time (suggested default: 30–45 minutes, i.e., 30–45 M1 bars) is closed at market. Scalping setups that haven't resolved within this window have likely lost their original thesis.
+[Heading 2] 5.2 Execution Quality Filters (New)
+[Unknown] M1 scalping margins are thin enough that spread, timing, and latency directly determine profitability. The original spec has no execution-quality gating.
+[List Paragraph] Spread Filter: No new entries are taken if live spread exceeds a configurable ceiling (e.g., 1.5x the symbol's 20-period average spread).
+[List Paragraph] Session Filter: Trading is restricted to defined session windows (e.g., London/New York overlap) where liquidity and order-block reaction quality are historically strongest; the system is dormant outside these windows.
+[List Paragraph] News Blackout: No new entries within a configurable window (e.g., 15 minutes before/after) of high-impact scheduled news events for the traded symbol's underlying currencies.
+[List Paragraph] Signal Latency Budget: If the time between signal generation and order submission exceeds a threshold (e.g., 1.5 seconds), the signal is discarded rather than executed late at a worse price.
+[List Paragraph] Requote / Partial Fill Handling: On a requote or partial fill response from the broker, the system re-evaluates current spread and price before resubmitting once; it does not retry indefinitely.
+[Heading 1] 6. Module 5: Unified Backtesting Matrix
+[Unknown] Provides a standalone execution framework designed to validate historical trading algorithms without interfering with active live server connections.
+[List Paragraph] Event-Driven Bar Replay Simulator: Ingests large datasets of historical M1 bars and replays them strictly bar-by-bar, maintaining the same order block register, mitigation, and exit-state logic used live, to recreate real-world price action and fill behavior.
+[List Paragraph] Performance Analytics Dashboard: Computes performance metrics, including total executed trade counts, historical drawdowns, win ratios, and net profit factors.
+[Heading 2] 6.1 Backtest Realism Requirements (Revised)
+[Unknown] The original term “vectorized loop simulator” implies whole-array vectorized computation (e.g., pandas vector operations across the full dataset at once). For a path-dependent strategy like order-block detection — where each bar's signal depends on the live state of a register that itself depends on prior bars — true vectorization risks introducing lookahead bias (using information not yet available at decision time). This revision specifies an event-driven, bar-by-bar replay architecture instead:
+[List Paragraph] Each historical bar is processed sequentially, updating the order block register and triggering signals exactly as the live engine would.
+[List Paragraph] Fills are modeled using the bid/ask spread at the time of the simulated signal, not the candle's close price, to avoid unrealistically favorable backtested entries.
+[List Paragraph] A configurable slippage model (e.g., 0.5–1 pip on market entries) is applied to approximate live execution conditions.
+[List Paragraph] Vectorized operations (e.g., pandas/numpy) may still be used internally for performance, provided the logic enforces strict causality — no bar's signal may reference data from a later bar.
+[Heading 1] 7. Module 6: Validation & Deployment Gate (New)
+[Unknown] The original design has no formal checkpoint between backtesting and live/demo deployment. Without one, there is a high risk of deploying a strategy that is overfit to its backtest period. This module defines the gate a strategy must pass before each escalation in deployment stage.
+[Heading 2] 7.1 Walk-Forward Validation
+[List Paragraph] Historical data is split into sequential in-sample (optimization) and out-of-sample (validation) windows — e.g., 70/30 or rolling 3-month windows.
+[List Paragraph] Any parameter (OB age limit, R-multiple target, displacement threshold, etc.) tuned on in-sample data must be re-evaluated, unmodified, on out-of-sample data before being considered valid.
+[List Paragraph] A material performance drop-off between in-sample and out-of-sample results (e.g., profit factor falling below 1.2, or win rate dropping more than 10 percentage points) is treated as evidence of overfitting and blocks promotion to the next stage.
+[Heading 2] 7.2 Deployment Stages
+[Heading 2] 7.3 Kill Criteria
+[Unknown] Independent of the daily 2% loss ceiling in Module 4, the following should trigger a full strategy review and trading pause:
+[List Paragraph] Drawdown exceeding 1.5x the maximum drawdown observed in backtesting.
+[List Paragraph] Five consecutive losing trades where each loss was a confirmed signal (not filtered by execution-quality rules) — may indicate regime change or logic drift.
+[List Paragraph] Any unhandled exception in the live execution path — the system should fail safe (flatten positions, halt new entries) rather than continue in an unknown state.
+[Heading 1] 8. Summary of Open Items for Future Revisions
+[List Paragraph] Trailing stop logic, once sufficient live data exists to model spread/noise behavior reliably.
+[List Paragraph] Dynamic position sizing adjustments based on recent realized volatility, beyond the fixed 0.25%/0.5% risk bands.
+[List Paragraph] Multi-symbol correlation checks, to avoid stacking correlated risk across pairs in the same session.
+[List Paragraph] Formal parameter-optimization methodology (e.g., grid search bounds, walk-forward re-optimization cadence) to keep Section 7.1 from becoming ad hoc.
+
+--- TABLE 1 ---
+Term | Definition | 
+Order Block (OB) | The candle(s) immediately preceding a displacement move that breaks structure; treated as a zone likely to attract a reaction on retest. | 
+Displacement | A candle or sequence of candles that moves price through a prior structural high/low with above-average range/momentum. | 
+Mitigation | Price returning to and trading into a cached order block zone. | 
+MSS | Market Structure Shift — a break of a prior swing high/low signaling a potential change in directional bias. | 
+R-multiple | Trade profit or loss expressed as a multiple of the initial risk (distance from entry to stop-loss). | 
+
+--- TABLE 2 ---
+Parameter Field | Data Type | Source Hook | Functional Purpose | 
+time | datetime64[ns] | mt5.copy_rates_from_pos | Candle time synchronization index. | 
+open / close | float64 | mt5.copy_rates_from_pos | Identifies displacement candles and directional closes. | 
+high / low | float64 | mt5.copy_rates_from_pos | Calculates structural breaks and mitigation triggers. | 
+tick_volume | int64 | mt5.copy_rates_from_pos | Filters out low-volatility price movements outside session hours. | 
+spread | int32 | mt5.symbol_info / tick | Live spread snapshot used by the execution filter (Module 4). | 
+
+--- TABLE 3 ---
+Stage | Gate Criteria | Minimum Duration | 
+1. Backtest | Positive expectancy on out-of-sample walk-forward data; max drawdown within risk tolerance. | N/A | 
+2. Demo (paper) | Live demo performance tracks backtest within an acceptable variance band; no execution errors or unhandled exceptions. | Suggested minimum 4–6 weeks or 100+ trades, whichever is longer. | 
+3. Live (minimum size) | Demo criteria sustained; manual review of every losing trade for unexpected behavior. | Suggested minimum 4 weeks before scaling size. | 
+4. Live (scaled) | Stage 3 criteria sustained at minimum size with no risk-rule breaches. | Ongoing, subject to periodic re-validation. | 
