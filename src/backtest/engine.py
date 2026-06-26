@@ -127,6 +127,9 @@ class BacktestEngine:
         partial_tp_fraction: float = 0.5,
         # Rev 3: Signal quality filter
         fvg_quality_threshold: float = 0.0,
+        # Rev 4: Trend filter
+        trend_filter_enabled: bool = False,
+        trend_ema_period: int = 200,
         cfg=None,
     ) -> None:
         self.symbol = symbol
@@ -167,6 +170,8 @@ class BacktestEngine:
             self._processor._cfg = type('Cfg', (), {
                 'fvg_require_confluence': False,
                 'fvg_filter_enabled': True,
+                'trend_filter_enabled': trend_filter_enabled,
+                'trend_ema_period': trend_ema_period,
             })()
             self._processor._register = OrderBlockRegister(
                 symbol, max_ob_age_bars, max_ob_per_symbol, ob_stack_tolerance
@@ -180,6 +185,12 @@ class BacktestEngine:
             self._processor._window_size = 25
             self._processor._bar_deque = deque(maxlen=25)
             self._processor._pending_candidates = []
+            
+            # Rev 4: Initialize trend filter state for the mock processor
+            self._processor._trend_filter_enabled = trend_filter_enabled
+            self._processor._ema_period = trend_ema_period
+            self._processor._ema_alpha = 2 / (trend_ema_period + 1)
+            self._processor._current_ema = None
 
         # Rev 3: Pre-compute rolling ATR for the full bar series
         if use_atr_sl:
@@ -206,9 +217,9 @@ class BacktestEngine:
             # ── Strict causality: pass ONLY bars[0..bar_idx] to the processor ──
             bar = self.bars.iloc[bar_idx]
 
-            # Compute avg spread from bars seen so far (causal)
+            # Compute avg spread from bars seen so far (causal) and convert MT5 points to pips (1 pip = 10 points)
             seen = self.bars.iloc[max(0, bar_idx - self.avg_spread_window): bar_idx + 1]
-            avg_spread_pips = compute_average_spread(seen, self.avg_spread_window)
+            avg_spread_pips = compute_average_spread(seen, self.avg_spread_window) / 10.0
 
             # ── 1. Evaluate open positions first ─────────────────────────────
             self._evaluate_open_positions(bar, bar_idx)
@@ -224,6 +235,9 @@ class BacktestEngine:
                 in_session = current_time >= self.session_start or current_time <= self.session_end
 
             for sig in signals:
+                # Rev 3: Signal logging to console
+                print(f"[SIGNAL] {sig.direction.name} at bar {bar_idx} (Close: {bar['close']:.5f}, OB: {sig.ob_bottom:.5f}-{sig.ob_top:.5f}, FVG: {sig.fvg_confluence})")
+                
                 if not in_session:
                     log.debug("Skipping signal at bar %d — outside session", bar_idx)
                     continue
@@ -256,11 +270,12 @@ class BacktestEngine:
         """Simulate entry with slippage. Rev 3: passes ATR to exit plan."""
         slippage = self.slippage_pips * self.pip_size
         if signal.direction == Direction.BULLISH:
-            entry_price = signal.entry_price + slippage   # filled at ask
+            entry_price = signal.entry_price + slippage   # filled at limit (ask)
         else:
-            entry_price = signal.entry_price - slippage   # filled at bid
+            entry_price = signal.entry_price - slippage   # filled at limit (bid)
 
-        spread_pips = float(bar.get("spread", 2))
+        # Convert MT5 points to pips for current spread
+        spread_pips = float(bar.get("spread", 20)) / 10.0
         plan = self._exit_mgr.create_exit_plan(
             signal=signal,
             entry_price=entry_price,

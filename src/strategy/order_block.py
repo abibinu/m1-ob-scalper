@@ -425,21 +425,16 @@ class OrderBlockRegister:
         current_bar_idx: int,
     ) -> List[OrderBlock]:
         """
-        4.1.4 Signal Confirmation: from the mitigated candidates, return those
-        where the current bar's close has returned OUTSIDE the OB zone.
-        The rejection must occur on the touch bar or the immediately following bar.
+        Check mitigated blocks to see if the current bar represents a valid
+        rejection close (4.1.4).
         """
         confirmed = []
         for block in candidate_blocks:
-            if block.touch_bar is None:
-                continue
-            if current_bar_idx - block.touch_bar > 1:
-                continue  # too late — rejection window expired
-            if self._is_rejection_close(block, bar):
-                confirmed.append(block)
-                block.active = False  # OB consumed — deactivate
-                log.debug("OB confirmed signal: %s [%.5f-%.5f] vol_score=%.2f",
-                          block.direction.name, block.bottom, block.top, block.volume_score)
+            if block.touch_bar is not None and current_bar_idx > block.touch_bar:
+                if self._is_rejection_close(block, bar):
+                    log.debug("OB confirmation (rejection close): %s at bar %d",
+                              block.direction.name, current_bar_idx)
+                    confirmed.append(block)
         return confirmed
 
     def invalidate_direction(self, direction: Direction, from_bar: int) -> None:
@@ -527,7 +522,12 @@ class StrategyProcessor:
         _lookback = getattr(cfg, "displacement_lookback", 20)
         self._window_size = _lookback + 5
         self._bar_deque: deque = deque(maxlen=self._window_size)
-        self._pending_candidates: List[OrderBlock] = []
+
+        # Rev 4: Trend Filter State
+        self._trend_filter_enabled = getattr(self._cfg, "trend_filter_enabled", False)
+        self._ema_period = getattr(self._cfg, "trend_ema_period", 200)
+        self._ema_alpha = 2 / (self._ema_period + 1)
+        self._current_ema = None
 
     def process_bar(
         self,
@@ -543,24 +543,27 @@ class StrategyProcessor:
         self._bar_deque.append(bar)
         signals: List[Signal] = []
 
+        # ── 0. Update Trend Filter EMA ───────────────────────────────────────
+        if self._trend_filter_enabled:
+            if self._current_ema is None:
+                self._current_ema = bar["close"]
+            else:
+                self._current_ema = (bar["close"] * self._ema_alpha) + (self._current_ema * (1 - self._ema_alpha))
+
         # ── 1. Update register (age / invalidation) ──────────────────────────
         self._register.update(bar, bar_idx, avg_spread)
 
-        # ── 2. Check rejection confirmations on pending candidates ───────────
-        confirmed = self._register.check_rejection_confirmation(
-            bar, self._pending_candidates, bar_idx
-        )
-        for block in confirmed:
-            sig = self._build_signal(block, bar, bar_idx, avg_spread)
-            signals.append(sig)
-        # Remove confirmed/expired candidates
-        self._pending_candidates = [
-            b for b in self._pending_candidates if b.active
-        ]
+        # ── 2. Check mitigation touches on active OBs ───────────────────────
+        self._register.check_mitigation(bar, bar_idx)
 
-        # ── 3. Check mitigation touches on active OBs ─────────────────────────
-        touched = self._register.check_mitigation(bar, bar_idx)
-        self._pending_candidates.extend(touched)
+        # ── 3. Check for rejection confirmations on mitigated OBs ────────────
+        mitigated = [b for b in self._register.active_blocks if b.mitigated]
+        if mitigated:
+            confirmed = self._register.check_rejection_confirmation(bar, mitigated, bar_idx)
+            for block in confirmed:
+                sig = self._build_signal(block, bar, bar_idx, avg_spread)
+                signals.append(sig)
+                block.active = False  # OB consumed — deactivate
 
         # ── 4. Scan for new displacement → register new OB ───────────────────
         if len(self._bar_deque) > 1:
@@ -569,6 +572,16 @@ class StrategyProcessor:
             result = self._scanner.scan(bars_df, len(bars_df) - 1)
             if result is not None:
                 direction, ob_idx, volume_score = result
+                
+                # Rev 4: Trend Filter
+                if self._trend_filter_enabled and self._current_ema is not None:
+                    if direction == Direction.BULLISH and bar["close"] < self._current_ema:
+                        log.debug("Filtered BULLISH OB at bar %d due to price below 200 EMA", bar_idx)
+                        return signals
+                    if direction == Direction.BEARISH and bar["close"] > self._current_ema:
+                        log.debug("Filtered BEARISH OB at bar %d due to price above 200 EMA", bar_idx)
+                        return signals
+
                 ob_bar = bars_df.iloc[ob_idx]
                 block = OrderBlock(
                     symbol=self.symbol,
@@ -601,7 +614,8 @@ class StrategyProcessor:
         Build a Signal from a confirmed OB. Computes FVG confluence and
         quality score (volume_score boosted by FVG presence).
         """
-        entry = block.midpoint
+        # Market entry at the rejection close price
+        entry = bar["close"]
 
         # Rev 3: FVG confluence check (M1 only)
         bars_df = pd.DataFrame(list(self._bar_deque)).reset_index(drop=True)

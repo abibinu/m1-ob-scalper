@@ -159,6 +159,23 @@ def print_report(report: BacktestReport, symbol: str, bars_count: int) -> None:
         print(f"  Deployment gate (PF>=1.2, WR>=40%): {gate_str}")
     else:
         print("  Deployment gate: N/A (not enough trades)")
+
+    # Final Balance calculation
+    import os
+    import MetaTrader5 as mt5
+    info = mt5.account_info()
+    if info:
+        start_bal = info.balance
+        currency = info.currency
+        risk_pct = float(os.environ.get("RISK_PCT", "0.5"))
+        # Simple interest projection based on R-multiples
+        projected_profit = start_bal * (risk_pct / 100) * s['total_pnl_r']
+        final_bal = start_bal + projected_profit
+        print()
+        print(_bar("Starting Balance", f"{start_bal:,.2f} {currency}"))
+        print(_bar(f"Simulated Profit (Risk {risk_pct}%)", f"{projected_profit:+,.2f} {currency}"))
+        print(_bar("Final Projected Balance", f"{final_bal:,.2f} {currency}"))
+
     print("=" * 60)
 
 
@@ -238,6 +255,11 @@ def main():
                         help="Enable partial TP")
     parser.add_argument("--fvg-threshold", type=float, default=float(os.environ.get("FVG_QUALITY_THRESHOLD", "0.0")),
                         help="Min signal quality score for entry [0-1]")
+    # Rev 4: Trend Filter
+    parser.add_argument("--trend-filter", type=lambda x: x.lower() == 'true', default=os.environ.get("TREND_FILTER_ENABLED", "false").lower() == 'true',
+                        help="Enable 200 EMA trend filter")
+    parser.add_argument("--trend-ema", type=int, default=int(os.environ.get("TREND_EMA_PERIOD", "200")),
+                        help="EMA period for trend filter")
     args = parser.parse_args()
 
     # ── Connect ───────────────────────────────────────────────────────────────
@@ -286,6 +308,9 @@ def main():
         partial_tp_r=float(os.environ.get("PARTIAL_TP_R", "1.0")),
         partial_tp_fraction=float(os.environ.get("PARTIAL_TP_FRACTION", "0.5")),
         fvg_quality_threshold=args.fvg_threshold,
+        # Rev 4
+        trend_filter_enabled=args.trend_filter,
+        trend_ema_period=args.trend_ema,
     )
     report = engine.run()
 

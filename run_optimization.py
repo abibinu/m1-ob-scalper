@@ -110,7 +110,7 @@ def objective(trial, symbol: str, bars: pd.DataFrame) -> float:
     report = engine.run()
 
     # Penalize if very few trades are taken
-    if report.total_trades < 15:
+    if report.total_trades < 10:
         return -100.0  # Heavy penalty for low trade count
 
     # ── Rev 3: Composite Sortino-based objective ───────────────────────────────
