@@ -127,9 +127,10 @@ class BacktestEngine:
         partial_tp_fraction: float = 0.5,
         # Rev 3: Signal quality filter
         fvg_quality_threshold: float = 0.0,
-        # Rev 4: Trend filter
+        # Rev 4: Trend filter & Daily Stop
         trend_filter_enabled: bool = False,
         trend_ema_period: int = 200,
+        max_daily_loss_r: float = 0.0,
         cfg=None,
     ) -> None:
         self.symbol = symbol
@@ -140,6 +141,12 @@ class BacktestEngine:
         self.fvg_quality_threshold = fvg_quality_threshold  # Rev 3
         self.use_atr_sl = use_atr_sl
         self.atr_period = atr_period
+        self.max_daily_loss_r = max_daily_loss_r
+        
+        # State for daily stop
+        self._current_date = None
+        self._daily_pnl_r = 0.0
+        self._daily_stop_hit = False
 
         from datetime import datetime
         self.session_start = datetime.strptime(session_start_utc, "%H:%M").time()
@@ -221,13 +228,35 @@ class BacktestEngine:
             seen = self.bars.iloc[max(0, bar_idx - self.avg_spread_window): bar_idx + 1]
             avg_spread_pips = compute_average_spread(seen, self.avg_spread_window) / 10.0
 
-            # ── 1. Evaluate open positions first ─────────────────────────────
+            # ── 1. Daily Tracking ──────────────────────────────────────────────
+            bar_date = bar["time"].date()
+            if self._current_date != bar_date:
+                self._current_date = bar_date
+                self._daily_pnl_r = 0.0
+                self._daily_stop_hit = False
+            
+            # ── 2. Evaluate open positions first ─────────────────────────────
+            num_closed_trades_before = len(self._completed_trades)
             self._evaluate_open_positions(bar, bar_idx)
+            
+            # Accumulate PnL for any trades closed on this bar
+            for t in self._completed_trades[num_closed_trades_before:]:
+                self._daily_pnl_r += t.pnl_r
+            
+            # Check Daily Stop
+            if self.max_daily_loss_r > 0 and self._daily_pnl_r <= -self.max_daily_loss_r:
+                if not self._daily_stop_hit:
+                    log.info("Max Daily Loss (%.2f R) hit at bar %d. Halting entries for %s", 
+                             self.max_daily_loss_r, bar_idx, self._current_date)
+                self._daily_stop_hit = True
 
-            # ── 2. Run strategy processor ─────────────────────────────────────
+            # ── 3. Run strategy processor ─────────────────────────────────────
             signals = self._processor.process_bar(bar, bar_idx, avg_spread_pips)
 
-            # ── 3. Enter new positions on confirmed signals ───────────────────
+            # ── 4. Enter new positions on confirmed signals ───────────────────
+            if self._daily_stop_hit:
+                continue # Skip entry logic entirely
+
             current_time = bar["time"].time()
             if self.session_start <= self.session_end:
                 in_session = self.session_start <= current_time <= self.session_end

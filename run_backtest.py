@@ -255,11 +255,13 @@ def main():
                         help="Enable partial TP")
     parser.add_argument("--fvg-threshold", type=float, default=float(os.environ.get("FVG_QUALITY_THRESHOLD", "0.0")),
                         help="Min signal quality score for entry [0-1]")
-    # Rev 4: Trend Filter
+    # Rev 4: Trend Filter & Daily Stop
     parser.add_argument("--trend-filter", type=lambda x: x.lower() == 'true', default=os.environ.get("TREND_FILTER_ENABLED", "false").lower() == 'true',
                         help="Enable 200 EMA trend filter")
     parser.add_argument("--trend-ema", type=int, default=int(os.environ.get("TREND_EMA_PERIOD", "200")),
                         help="EMA period for trend filter")
+    parser.add_argument("--max-daily-loss", type=float, default=float(os.environ.get("MAX_DAILY_LOSS_R", "0.0")),
+                        help="Max daily loss in R (0 = disabled)")
     args = parser.parse_args()
 
     # ── Connect ───────────────────────────────────────────────────────────────
@@ -311,6 +313,7 @@ def main():
         # Rev 4
         trend_filter_enabled=args.trend_filter,
         trend_ema_period=args.trend_ema,
+        max_daily_loss_r=args.max_daily_loss,
     )
     report = engine.run()
 

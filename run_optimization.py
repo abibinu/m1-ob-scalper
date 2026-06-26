@@ -47,9 +47,9 @@ def compute_sortino(trades, target_r: float = 0.0) -> float:
 
 def objective(trial, symbol: str, bars: pd.DataFrame) -> float:
     # ── Core parameters ───────────────────────────────────────────────────────
-    r_multiple = trial.suggest_float("r_multiple", 1.0, 4.0, step=0.1)
-    sl_spread_buffer = trial.suggest_float("sl_spread_buffer", 1.0, 3.0, step=0.1)
-    breakeven_at_r = trial.suggest_float("breakeven_at_r", 0.0, 2.0, step=0.1)
+    r_multiple = trial.suggest_float("r_multiple", 1.0, 2.5, step=0.1)
+    sl_spread_buffer = trial.suggest_float("sl_spread_buffer", 5.0, 25.0, step=1.0)
+    breakeven_at_r = trial.suggest_float("breakeven_at_r", 0.0, 1.5, step=0.1)
     max_hold_bars = trial.suggest_int("max_hold_bars", 15, 120, step=5)
     max_ob_age_bars = trial.suggest_int("max_ob_age_bars", 30, 150, step=5)
     displacement_threshold = trial.suggest_float("displacement_threshold", 0.8, 2.5, step=0.1)
@@ -105,6 +105,8 @@ def objective(trial, symbol: str, bars: pd.DataFrame) -> float:
         fvg_quality_threshold=fvg_quality_threshold,
         session_start_utc=os.environ.get("SESSION_START_UTC", "00:00"),
         session_end_utc=os.environ.get("SESSION_END_UTC", "23:59"),
+        trend_filter_enabled=os.environ.get("TREND_FILTER_ENABLED", "false").lower() == 'true',
+        trend_ema_period=int(os.environ.get("TREND_EMA_PERIOD", "200")),
     )
 
     report = engine.run()
