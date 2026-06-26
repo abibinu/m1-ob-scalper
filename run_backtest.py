@@ -217,12 +217,12 @@ def main():
                         help="Number of M1 bars to fetch (default: 5000 ≈ 3 weeks)")
     parser.add_argument("--slippage", type=float, default=0.5,
                         help="Simulated slippage in pips (default: 0.5)")
-    parser.add_argument("--r-multiple", type=float, default=2.0,
-                        help="Take-profit R multiple (default: 2.0)")
-    parser.add_argument("--breakeven", type=float, default=1.0,
-                        help="Move SL to BE at N*R (0=disabled, default: 1.0)")
-    parser.add_argument("--displacement", type=float, default=1.5,
-                        help="Displacement threshold multiplier (default: 1.5)")
+    parser.add_argument("--r-multiple", type=float, default=float(os.environ.get("R_MULTIPLE_TP", "2.0")),
+                        help="Take-profit R multiple")
+    parser.add_argument("--breakeven", type=float, default=float(os.environ.get("BREAKEVEN_AT_R", "1.0")),
+                        help="Move SL to BE at N*R")
+    parser.add_argument("--displacement", type=float, default=float(os.environ.get("DISPLACEMENT_THRESHOLD", "1.5")),
+                        help="Displacement threshold multiplier")
     parser.add_argument("--walk-forward", action="store_true",
                         help="Run walk-forward validation (70/30 IS/OOS split)")
     parser.add_argument("--trades", action="store_true",
@@ -230,14 +230,14 @@ def main():
     parser.add_argument("--cache", action="store_true",
                         help="Cache downloaded data to CSV for faster re-runs")
     # Rev 3
-    parser.add_argument("--use-atr-sl", action="store_true",
-                        help="Use adaptive ATR-based SL instead of fixed spread buffer")
-    parser.add_argument("--atr-multiplier", type=float, default=1.0,
-                        help="ATR SL multiplier (default: 1.0)")
-    parser.add_argument("--partial-tp", action="store_true",
-                        help="Enable partial TP: close 50%% at 1R, let rest run")
-    parser.add_argument("--fvg-threshold", type=float, default=0.0,
-                        help="Min signal quality score for entry [0-1] (default: 0 = disabled)")
+    parser.add_argument("--use-atr-sl", type=lambda x: x.lower() == 'true', default=os.environ.get("USE_ATR_SL", "false").lower() == 'true',
+                        help="Use adaptive ATR-based SL")
+    parser.add_argument("--atr-multiplier", type=float, default=float(os.environ.get("ATR_SL_MULTIPLIER", "1.0")),
+                        help="ATR SL multiplier")
+    parser.add_argument("--partial-tp", type=lambda x: x.lower() == 'true', default=os.environ.get("PARTIAL_TP_ENABLED", "false").lower() == 'true',
+                        help="Enable partial TP")
+    parser.add_argument("--fvg-threshold", type=float, default=float(os.environ.get("FVG_QUALITY_THRESHOLD", "0.0")),
+                        help="Min signal quality score for entry [0-1]")
     args = parser.parse_args()
 
     # ── Connect ───────────────────────────────────────────────────────────────
