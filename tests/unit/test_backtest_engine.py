@@ -305,6 +305,8 @@ class TestBacktestEnginePnL:
             risk_pips=10.0,
             r_target_pips=20.0,
             breakeven_price=0.0,
+            trailing_activation_price=0.0,
+            trailing_distance_pips=0.0,
             max_bar=50,
             direction=Direction.BULLISH,
         )
@@ -338,6 +340,8 @@ class TestBacktestEnginePnL:
             risk_pips=10.0,
             r_target_pips=20.0,
             breakeven_price=0.0,
+            trailing_activation_price=0.0,
+            trailing_distance_pips=0.0,
             max_bar=50,
             direction=Direction.BEARISH,
         )

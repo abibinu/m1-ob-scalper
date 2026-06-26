@@ -1,0 +1,170 @@
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+*.egg-link
+MANIFEST
+
+# ─────────────────────────────────────────────────────────────
+# Virtual Environments
+# ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env.venv/
+Pipfile.lock
+poetry.lock
+
+# ─────────────────────────────────────────────────────────────
+# Environment & Secrets (NEVER commit credentials)
+# ─────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets.toml
+*.pem
+*.key
+
+# ─────────────────────────────────────────────────────────────
+# Cached bar data & news calendar (can be large / regenerated)
+# ─────────────────────────────────────────────────────────────
+data/
+!data/.gitkeep
+
+# ─────────────────────────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+
+# ─────────────────────────────────────────────────────────────
+# Test & Coverage artifacts
+# ─────────────────────────────────────────────────────────────
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.tox/
+nosetests.xml
+test-results/
+junit*.xml
+
+# ─────────────────────────────────────────────────────────────
+# Optuna study databases
+# ─────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+optuna_*.db
+
+# ─────────────────────────────────────────────────────────────
+# Type checking & linting
+# ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# ─────────────────────────────────────────────────────────────
+# Jupyter / IPython
+# ─────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─────────────────────────────────────────────────────────────
+# IDE & Editor files
+# ─────────────────────────────────────────────────────────────
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Cursor
+.cursor/
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*#
+.\#*
+.dir-locals.el
+
+# ─────────────────────────────────────────────────────────────
+# OS-generated files
+# ─────────────────────────────────────────────────────────────
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+
+# ─────────────────────────────────────────────────────────────
+# MT5 / Trading specific
+# ─────────────────────────────────────────────────────────────
+
+# Exported MT5 tick/bar files
+*.csv
+# (but keep the news calendar template if you add one)
+!data/news_calendar_example.csv
+
+# MT5 backtest reports
+*.htm
+*.html
+
+# ─────────────────────────────────────────────────────────────
+# Documentation build artifacts
+# ─────────────────────────────────────────────────────────────
+docs/_build/
+site/
+
+# ─────────────────────────────────────────────────────────────
+# Miscellaneous
+# ─────────────────────────────────────────────────────────────
+*.bak
+*.tmp
+*.temp
+*.orig
+sdd_content.txt

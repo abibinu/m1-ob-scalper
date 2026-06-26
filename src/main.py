@@ -34,9 +34,12 @@ from src.connection.mt5_client import MT5Client
 from src.core.config import get_config
 from src.core.logger import get_logger
 from src.data.market_data import compute_average_spread, fetch_bars
+from src.data.atr_calculator import compute_atr_pips          # Rev 3
+from src.data.news_loader import refresh_news_if_stale         # Rev 3
 from src.execution.exit_manager import ExitManager, ExitPlan, ExitReason
 from src.execution.order_executor import ExecutionConfig, OrderExecutor
 from src.execution.risk_manager import DailyLossTracker, SymbolInfo, calculate_lot_size
+from src.execution.session_scorer import SessionScorer         # Rev 3
 from src.strategy.order_block import StrategyProcessor
 from src.strategy.signal import Direction, Signal
 
@@ -115,6 +118,11 @@ class TradingBot:
             sl_spread_buffer=self._cfg.sl_spread_buffer,
             breakeven_at_r=self._cfg.breakeven_at_r,
             max_hold_bars=self._cfg.max_hold_bars,
+            use_atr_sl=self._cfg.use_atr_sl,
+            atr_sl_multiplier=self._cfg.atr_sl_multiplier,
+            partial_tp_enabled=self._cfg.partial_tp_enabled,
+            partial_tp_r=self._cfg.partial_tp_r,
+            partial_tp_fraction=self._cfg.partial_tp_fraction,
         )
 
         # Execution quality
@@ -126,12 +134,18 @@ class TradingBot:
             spread_filter_multiplier=self._cfg.spread_filter_multiplier,
             signal_latency_budget_s=self._cfg.signal_latency_budget_s,
             news_blackout_minutes=self._cfg.news_blackout_minutes,
+            fvg_quality_threshold=self._cfg.fvg_quality_threshold,    # Rev 3
+            session_strength_min=self._cfg.session_strength_min,       # Rev 3
         )
         self._executor = OrderExecutor(exec_cfg)
 
         # Bar cache per symbol
         self._bar_cache: Dict[str, pd.DataFrame] = {}
         self._bar_idx: Dict[str, int] = {}
+
+        # Rev 3: Session scorer (built from first bar fetch) and news loader
+        self._session_scorer: Optional[SessionScorer] = None
+        self._news_last_refresh: Optional[datetime] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -154,6 +168,10 @@ class TradingBot:
         for sym in self._cfg.symbols:
             self._processors[sym] = StrategyProcessor(sym, cfg=self._cfg)
             self._bar_idx[sym] = 0
+
+        # Rev 3: Load news and build initial session scorer from recent bars
+        self._refresh_news()
+        self._init_session_scorer()
 
         self._running = True
         self._main_loop()
@@ -190,6 +208,9 @@ class TradingBot:
                 log.critical("Daily loss ceiling hit — bot halted. Exiting loop.")
                 break
 
+            # Rev 3: Periodic news refresh (every NEWS_CACHE_MAX_AGE_HOURS)
+            self._refresh_news()
+
             for symbol in self._cfg.symbols:
                 try:
                     result = fetch_bars(symbol, count=200)
@@ -220,6 +241,14 @@ class TradingBot:
         avg_spread = compute_average_spread(bars)
         current_spread_pips = float(bar.get("spread", 2))
 
+        # Rev 3: ATR for adaptive SL
+        atr_pips = compute_atr_pips(bars, period=self._cfg.atr_period) if self._cfg.use_atr_sl else 0.0
+
+        # Rev 3: Session strength score for this hour
+        session_strength = 1.0
+        if self._session_scorer and self._cfg.session_strength_min > 0:
+            session_strength = self._session_scorer.get_hour_strength(bar["time"].hour)
+
         # ── Run strategy ──────────────────────────────────────────────────────
         signals = self._processors[symbol].process_bar(bar, idx, avg_spread)
 
@@ -227,13 +256,15 @@ class TradingBot:
         for signal in signals:
             now = datetime.now(timezone.utc)
             filter_result = self._executor.run_filters(
-                signal, current_spread_pips, avg_spread, now_utc=now
+                signal, current_spread_pips, avg_spread,
+                now_utc=now,
+                session_strength_score=session_strength,   # Rev 3
             )
             if not filter_result.passed:
                 log.info("Signal filtered: %s", filter_result.reason)
                 continue
 
-            self._submit_order(signal, bar, idx, current_spread_pips)
+            self._submit_order(signal, bar, idx, current_spread_pips, atr_pips=atr_pips)
 
     def _submit_order(
         self,
@@ -241,6 +272,7 @@ class TradingBot:
         bar: pd.Series,
         bar_idx: int,
         spread_pips: float,
+        atr_pips: float = 0.0,        # Rev 3
     ) -> None:
         """Build and send a market order for a confirmed signal."""
         sym_info = _get_symbol_info(signal.symbol)
@@ -270,7 +302,7 @@ class TradingBot:
             price = tick.bid
 
         plan = self._exit_mgr.create_exit_plan(
-            signal, price, bar_idx, spread_pips
+            signal, price, bar_idx, spread_pips, atr_pips=atr_pips  # Rev 3
         )
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -303,6 +335,35 @@ class TradingBot:
                 log.info("Requote retry result: %s", result2)
         else:
             log.error("Order send failed: %s", result)
+
+    # ── Rev 3: Helper methods ────────────────────────────────────────────────
+
+    def _refresh_news(self) -> None:
+        """Refresh investing.com news calendar if stale or on first call."""
+        try:
+            events = refresh_news_if_stale(
+                currencies=list(self._cfg.news_currencies),
+                max_age_hours=self._cfg.news_cache_max_age_hours,
+            )
+            self._executor.set_news_events(events)
+            self._news_last_refresh = datetime.now(timezone.utc)
+            if events:
+                log.info("News blackout: %d events loaded for %s",
+                         len(events), self._cfg.news_currencies)
+        except Exception as e:
+            log.warning("Failed to refresh news calendar: %s", e)
+
+    def _init_session_scorer(self) -> None:
+        """Build session strength profile from recent historical bars."""
+        if not self._cfg.symbols:
+            return
+        sym = self._cfg.symbols[0]
+        try:
+            result = fetch_bars(sym, count=5000)
+            self._session_scorer = SessionScorer(result.bars)
+            log.info("Session scorer built from %d bars for %s", len(result.bars), sym)
+        except Exception as e:
+            log.warning("Failed to build session scorer: %s", e)
 
 
 def main() -> None:

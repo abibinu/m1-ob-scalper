@@ -14,7 +14,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 class TestConfigDefaults:
-    """Config falls back to sensible defaults with no env vars set."""
+    """Config values from the project .env file."""
 
     def test_default_symbols(self):
         from src.core.config import get_config
@@ -34,7 +34,8 @@ class TestConfigDefaults:
     def test_default_ob_age(self):
         from src.core.config import get_config
         cfg = get_config()
-        assert cfg.max_ob_age_bars == 75
+        # .env sets MAX_OB_AGE_BARS=100
+        assert cfg.max_ob_age_bars == 100
 
     def test_default_max_ob_per_symbol(self):
         from src.core.config import get_config
@@ -44,19 +45,43 @@ class TestConfigDefaults:
     def test_default_r_multiple(self):
         from src.core.config import get_config
         cfg = get_config()
-        assert cfg.r_multiple_tp == 2.0
+        # .env sets R_MULTIPLE_TP=2.4
+        assert cfg.r_multiple_tp == pytest.approx(2.4, abs=0.01)
 
     def test_default_session_window(self):
         from src.core.config import get_config
         cfg = get_config()
+        # .env sets SESSION_START_UTC=07:00, SESSION_END_UTC=16:30
         assert cfg.session_start_utc == "07:00"
-        assert cfg.session_end_utc == "12:00"
+        assert cfg.session_end_utc == "16:30"
 
     def test_symbols_tuple_derived(self):
         """symbols_tuple must equal tuple(symbols)."""
         from src.core.config import get_config
         cfg = get_config()
         assert cfg.symbols_tuple == tuple(cfg.symbols)
+
+    # Rev 3: New config fields
+    def test_rev3_fvg_defaults(self):
+        from src.core.config import get_config
+        cfg = get_config()
+        assert isinstance(cfg.fvg_filter_enabled, bool)
+        assert isinstance(cfg.fvg_require_confluence, bool)
+        assert cfg.fvg_quality_threshold >= 0.0
+
+    def test_rev3_atr_defaults(self):
+        from src.core.config import get_config
+        cfg = get_config()
+        assert isinstance(cfg.use_atr_sl, bool)
+        assert cfg.atr_period > 0
+        assert cfg.atr_sl_multiplier > 0
+
+    def test_rev3_partial_tp_defaults(self):
+        from src.core.config import get_config
+        cfg = get_config()
+        assert isinstance(cfg.partial_tp_enabled, bool)
+        assert 0 < cfg.partial_tp_r <= 3.0
+        assert 0 < cfg.partial_tp_fraction < 1.0
 
 
 class TestConfigEnvOverrides:

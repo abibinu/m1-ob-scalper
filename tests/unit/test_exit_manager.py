@@ -140,6 +140,8 @@ class TestEvaluateBarBullish:
             risk_pips=20.0,
             r_target_pips=40.0,
             breakeven_price=be,
+            trailing_activation_price=0.0,
+            trailing_distance_pips=0.0,
             max_bar=max_bar,
             direction=Direction.BULLISH,
         )
@@ -204,6 +206,8 @@ class TestEvaluateBarBearish:
             risk_pips=20.0,
             r_target_pips=40.0,
             breakeven_price=be,
+            trailing_activation_price=0.0,
+            trailing_distance_pips=0.0,
             max_bar=50,
             direction=Direction.BEARISH,
         )

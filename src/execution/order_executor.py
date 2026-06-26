@@ -3,13 +3,15 @@ Module 4 — Order Executor (Execution Quality Filters)
 =====================================================
 Applies all execution-quality gates before submitting an order:
 
+  Quality Gate:     Skip if signal quality_score < fvg_quality_threshold (Rev 3)
   Spread Filter:    Skip if live spread > 1.5× 20-bar average
   Session Filter:   Dormant outside London/NY overlap window (UTC)
-  News Blackout:    Placeholder — no entries within N minutes of high-impact events
+  Strength Filter:  Skip if hourly volatility score < session_strength_min (Rev 3)
+  News Blackout:    No entries within N minutes of high-impact events
   Latency Budget:   Discard signal if >1.5s elapsed since signal generation
   Requote handler:  Re-evaluate spread/price once on requote; never retry twice
 
-SDD Rev 2, Section 5.2.
+SDD Rev 2, Section 5.2 + Rev 3 enhancements.
 """
 
 from __future__ import annotations
@@ -37,6 +39,38 @@ class FilterResult:
 
 
 # ── Individual filter functions ───────────────────────────────────────────────
+
+def check_signal_quality(
+    signal: "Signal",
+    quality_threshold: float = 0.0,
+) -> FilterResult:
+    """
+    Rev 3: Reject signals whose quality_score falls below the threshold.
+
+    quality_score combines:
+      - volume_score: displacement candle volume vs lookback average
+      - FVG confluence bonus (+0.25)
+
+    A quality_threshold of 0.0 disables this filter (all signals pass).
+
+    Args:
+        signal:            The confirmed Signal.
+        quality_threshold: Minimum quality_score to allow entry [0.0–1.0].
+    """
+    if quality_threshold <= 0.0:
+        return FilterResult(passed=True)
+    if signal.quality_score < quality_threshold:
+        return FilterResult(
+            passed=False,
+            reason=(
+                f"Signal quality too low: {signal.quality_score:.2f} < "
+                f"threshold {quality_threshold:.2f} "
+                f"(FVG={'yes' if signal.fvg_confluence else 'no'})"
+            ),
+            details={"quality_score": signal.quality_score, "threshold": quality_threshold},
+        )
+    return FilterResult(passed=True)
+
 
 def check_spread_filter(
     current_spread_pips: float,
@@ -90,6 +124,33 @@ def check_session_filter(
     )
 
 
+def check_session_strength(
+    hour_utc: int,
+    strength_score: float,
+    min_strength: float = 0.0,
+) -> FilterResult:
+    """
+    Rev 3: Reject entry if the current UTC hour has a low historical volatility score.
+
+    Args:
+        hour_utc:      Current UTC hour (0–23).
+        strength_score: Pre-computed score from SessionScorer.get_hour_strength().
+        min_strength:   Minimum score to allow entry (0.0 = disabled).
+    """
+    if min_strength <= 0.0:
+        return FilterResult(passed=True)
+    if strength_score < min_strength:
+        return FilterResult(
+            passed=False,
+            reason=(
+                f"Session strength too low: hour {hour_utc:02d}UTC "
+                f"score={strength_score:.2f} < min={min_strength:.2f}"
+            ),
+            details={"hour": hour_utc, "score": strength_score, "min": min_strength},
+        )
+    return FilterResult(passed=True)
+
+
 def check_latency_filter(
     signal_time: datetime,
     now_utc: Optional[datetime] = None,
@@ -120,14 +181,11 @@ def check_news_blackout(
     blackout_minutes: int = 15,
 ) -> FilterResult:
     """
-    Placeholder news blackout filter.
+    News blackout filter. Rejects entry if ``now_utc`` is within
+    ``blackout_minutes`` of any scheduled high-impact event.
 
-    Rejects entry if ``now_utc`` is within ``blackout_minutes`` of any
-    scheduled high-impact event in ``news_events``.
-
-    In a production deployment, ``news_events`` would be populated from
-    a news feed (e.g., Forex Factory API or ForexLive). This version
-    checks a manually provided list.
+    In production, ``news_events`` is populated by ``src.data.news_loader``
+    which scrapes investing.com and caches events locally.
 
     Args:
         now_utc:           Current UTC datetime.
@@ -156,6 +214,9 @@ class ExecutionConfig:
     spread_filter_multiplier: float = 1.5
     signal_latency_budget_s: float = 1.5
     news_blackout_minutes: int = 15
+    # Rev 3
+    fvg_quality_threshold: float = 0.0    # 0 = disabled
+    session_strength_min: float = 0.0     # 0 = disabled
 
 
 class OrderExecutor:
@@ -178,17 +239,25 @@ class OrderExecutor:
         current_spread_pips: float,
         avg_spread_pips: float,
         now_utc: Optional[datetime] = None,
+        session_strength_score: float = 1.0,
     ) -> FilterResult:
         """
         Run the full quality filter pipeline. Returns on first failure.
 
         Filters applied in order:
+          0. Signal quality score (FVG + volume — Rev 3)
           1. Session window
-          2. Spread ceiling
-          3. Signal latency budget
-          4. News blackout
+          2. Session hour strength (Rev 3)
+          3. Spread ceiling
+          4. Signal latency budget
+          5. News blackout
         """
         now = now_utc or datetime.now(timezone.utc)
+
+        # 0. Signal quality (Rev 3)
+        quality_result = check_signal_quality(signal, self._cfg.fvg_quality_threshold)
+        if not quality_result.passed:
+            return quality_result
 
         # 1. Session
         session_result = check_session_filter(
@@ -197,7 +266,15 @@ class OrderExecutor:
         if not session_result.passed:
             return session_result
 
-        # 2. Spread
+        # 2. Session strength (Rev 3)
+        if self._cfg.session_strength_min > 0.0:
+            strength_result = check_session_strength(
+                now.hour, session_strength_score, self._cfg.session_strength_min
+            )
+            if not strength_result.passed:
+                return strength_result
+
+        # 3. Spread
         spread_result = check_spread_filter(
             current_spread_pips,
             avg_spread_pips,
@@ -206,7 +283,7 @@ class OrderExecutor:
         if not spread_result.passed:
             return spread_result
 
-        # 3. Latency
+        # 4. Latency
         latency_result = check_latency_filter(
             signal.confirmation_time,
             now,
@@ -215,7 +292,7 @@ class OrderExecutor:
         if not latency_result.passed:
             return latency_result
 
-        # 4. News blackout
+        # 5. News blackout
         news_result = check_news_blackout(
             now, self._news_events, self._cfg.news_blackout_minutes
         )

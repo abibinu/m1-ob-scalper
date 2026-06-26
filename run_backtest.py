@@ -229,6 +229,15 @@ def main():
                         help="Print individual trade list")
     parser.add_argument("--cache", action="store_true",
                         help="Cache downloaded data to CSV for faster re-runs")
+    # Rev 3
+    parser.add_argument("--use-atr-sl", action="store_true",
+                        help="Use adaptive ATR-based SL instead of fixed spread buffer")
+    parser.add_argument("--atr-multiplier", type=float, default=1.0,
+                        help="ATR SL multiplier (default: 1.0)")
+    parser.add_argument("--partial-tp", action="store_true",
+                        help="Enable partial TP: close 50%% at 1R, let rest run")
+    parser.add_argument("--fvg-threshold", type=float, default=0.0,
+                        help="Min signal quality score for entry [0-1] (default: 0 = disabled)")
     args = parser.parse_args()
 
     # ── Connect ───────────────────────────────────────────────────────────────
@@ -269,6 +278,14 @@ def main():
         trailing_stop_distance_pips=float(os.environ.get("TRAILING_STOP_DISTANCE_PIPS", "0.0")),
         session_start_utc=os.environ.get("SESSION_START_UTC", "00:00"),
         session_end_utc=os.environ.get("SESSION_END_UTC", "23:59"),
+        # Rev 3
+        use_atr_sl=args.use_atr_sl,
+        atr_sl_multiplier=args.atr_multiplier,
+        atr_period=int(os.environ.get("ATR_PERIOD", "14")),
+        partial_tp_enabled=args.partial_tp,
+        partial_tp_r=float(os.environ.get("PARTIAL_TP_R", "1.0")),
+        partial_tp_fraction=float(os.environ.get("PARTIAL_TP_FRACTION", "0.5")),
+        fvg_quality_threshold=args.fvg_threshold,
     )
     report = engine.run()
 

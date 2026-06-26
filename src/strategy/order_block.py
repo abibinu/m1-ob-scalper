@@ -1,19 +1,26 @@
 """
 Module 3: Algorithmic Strategy Processor — Order Block Detection & Lifecycle
 =============================================================================
-Implements the complete order block state machine per SDD Rev 2, Sections 4 & 4.1:
+Implements the complete order block state machine per SDD Rev 2, Sections 4 & 4.1,
+extended with Rev 3 enhancements:
 
 Key components:
-  OrderBlock         — dataclass representing a single cached zone.
-  OrderBlockRegister — manages the active set of OBs with lifecycle rules.
-  DisplacementScanner — detects qualifying displacement moves.
-  StrategyProcessor  — top-level per-bar processor wiring all components.
+  OrderBlock          — dataclass representing a single cached zone.
+  OrderBlockRegister  — manages the active set of OBs with lifecycle rules.
+  DisplacementScanner — detects qualifying displacement moves (volume-weighted).
+  FairValueGapScanner — detects M1 3-bar Fair Value Gaps (imbalances).
+  StrategyProcessor   — top-level per-bar processor wiring all components.
 
 Lifecycle rules enforced:
   4.1.1 Validity window      — OB expires after max_age_bars
   4.1.2 Invalidation         — close through far boundary, or newer displacement
   4.1.3 Stacking & overlap   — merge OBs within 1.5× avg spread tolerance
   4.1.4 Signal confirmation  — rejection close required (touch alone = candidate)
+
+Rev 3 additions:
+  - volume_score on OrderBlock (displacement candle volume vs lookback avg)
+  - FairValueGapScanner: M1 3-bar imbalance detection
+  - Signal carries fvg_confluence + quality_score for downstream filtering
 """
 
 from __future__ import annotations
@@ -38,20 +45,23 @@ class OrderBlock:
     A single cached order block zone.
 
     Attributes:
-        symbol:      Instrument.
-        direction:   BULLISH (demand zone below price) or BEARISH (supply zone above).
-        top:         Upper price boundary.
-        bottom:      Lower price boundary.
-        birth_bar:   Bar index when the OB was created.
-        mitigated:   True once price has entered the zone (candidate state).
-        touch_bar:   Bar index of the most recent mitigation touch.
-        active:      False once expired/invalidated.
+        symbol:       Instrument.
+        direction:    BULLISH (demand zone below price) or BEARISH (supply zone above).
+        top:          Upper price boundary.
+        bottom:       Lower price boundary.
+        birth_bar:    Bar index when the OB was created.
+        volume_score: Displacement candle volume as a ratio of lookback average (Rev 3).
+                      1.0 = average; >1.0 = above-average institutional footprint.
+        mitigated:    True once price has entered the zone (candidate state).
+        touch_bar:    Bar index of the most recent mitigation touch.
+        active:       False once expired/invalidated.
     """
     symbol: str
     direction: Direction
     top: float
     bottom: float
     birth_bar: int
+    volume_score: float = 1.0       # Rev 3: displacement volume ratio
     mitigated: bool = False
     touch_bar: Optional[int] = None
     active: bool = True
@@ -76,18 +86,134 @@ class OrderBlock:
 
     @classmethod
     def merge(cls, a: "OrderBlock", b: "OrderBlock") -> "OrderBlock":
-        """Merge two overlapping OBs into a single zone using outermost boundaries."""
+        """Merge two overlapping OBs into a single zone using outermost boundaries.
+        Rev 3: the block with the higher volume_score takes precedence for birth_bar
+        and dominates the merged score.
+        """
         assert a.direction == b.direction
         assert a.symbol == b.symbol
-        # Newer OB takes precedence for birth_bar
-        newer = a if a.birth_bar >= b.birth_bar else b
+        # Higher volume_score is the stronger institutional block
+        dominant = a if a.volume_score >= b.volume_score else b
         return cls(
             symbol=a.symbol,
             direction=a.direction,
             top=max(a.top, b.top),
             bottom=min(a.bottom, b.bottom),
-            birth_bar=newer.birth_bar,
+            birth_bar=dominant.birth_bar,
+            volume_score=max(a.volume_score, b.volume_score),
         )
+
+
+# ── FairValueGap dataclass ────────────────────────────────────────────────────
+
+@dataclass
+class FairValueGap:
+    """
+    A 3-bar M1 Fair Value Gap (imbalance zone).
+
+    A bullish FVG:  bar[i-2].high < bar[i].low  (upward gap, demand imbalance)
+    A bearish FVG:  bar[i-2].low  > bar[i].high (downward gap, supply imbalance)
+
+    Attributes:
+        direction: BULLISH = price gapped up (demand); BEARISH = price gapped down (supply).
+        top:       Upper boundary of the gap.
+        bottom:    Lower boundary of the gap.
+        bar_index: Index of the third bar (i) that completed the FVG.
+    """
+    direction: Direction
+    top: float
+    bottom: float
+    bar_index: int
+
+    @property
+    def midpoint(self) -> float:
+        return (self.top + self.bottom) / 2
+
+    def overlaps_ob(self, ob: OrderBlock) -> bool:
+        """True if this FVG zone overlaps with the given order block zone."""
+        if self.direction != ob.direction:
+            return False
+        # Check if the two zones overlap at all
+        return self.top >= ob.bottom and self.bottom <= ob.top
+
+
+# ── FairValueGapScanner ───────────────────────────────────────────────────────
+
+class FairValueGapScanner:
+    """
+    Detects M1 3-bar Fair Value Gaps (imbalances) using the standard ICT definition:
+
+    Bullish FVG (demand imbalance, price gapped up):
+        bar[i-2].high < bar[i].low
+        Gap zone: [bar[i-2].high, bar[i].low]
+
+    Bearish FVG (supply imbalance, price gapped down):
+        bar[i-2].low > bar[i].high
+        Gap zone: [bar[i].high, bar[i-2].low]
+
+    Used to confirm order blocks — an OB co-located with an FVG is a
+    high-confidence institutional zone.
+    """
+
+    def scan_recent(
+        self,
+        bars: pd.DataFrame,
+        current_idx: int,
+        lookback: int = 10,
+    ) -> List[FairValueGap]:
+        """
+        Scan the last ``lookback`` bars for any active FVG patterns.
+
+        Args:
+            bars:        Full bar DataFrame.
+            current_idx: Index of the most recent bar.
+            lookback:    How many bars back to search for FVGs.
+
+        Returns:
+            List of detected FairValueGap objects (may be empty).
+        """
+        fvgs: List[FairValueGap] = []
+        start = max(2, current_idx - lookback)
+
+        for i in range(start, current_idx + 1):
+            if i < 2 or i >= len(bars):
+                continue
+            b0 = bars.iloc[i - 2]   # two bars ago
+            b2 = bars.iloc[i]       # current bar
+
+            # Bullish FVG: b0.high < b2.low (gap up — demand imbalance)
+            if b0["high"] < b2["low"]:
+                fvgs.append(FairValueGap(
+                    direction=Direction.BULLISH,
+                    top=b2["low"],
+                    bottom=b0["high"],
+                    bar_index=i,
+                ))
+
+            # Bearish FVG: b0.low > b2.high (gap down — supply imbalance)
+            elif b0["low"] > b2["high"]:
+                fvgs.append(FairValueGap(
+                    direction=Direction.BEARISH,
+                    top=b0["low"],
+                    bottom=b2["high"],
+                    bar_index=i,
+                ))
+
+        return fvgs
+
+    def check_confluence(
+        self,
+        ob: OrderBlock,
+        bars: pd.DataFrame,
+        current_idx: int,
+        lookback: int = 20,
+    ) -> bool:
+        """
+        Return True if any recently-detected FVG overlaps with ``ob``.
+        Used to mark a signal as having FVG confluence.
+        """
+        fvgs = self.scan_recent(bars, current_idx, lookback=lookback)
+        return any(fvg.overlaps_ob(ob) for fvg in fvgs)
 
 
 # ── Displacement Scanner ──────────────────────────────────────────────────────
@@ -103,6 +229,9 @@ class DisplacementScanner:
                             (the last bearish candle before the upward move)
       BEARISH displacement → close breaks below prior low  → creates BULLISH OB
                             (the last bullish candle before the downward move)
+
+    Rev 3: also returns the volume_score (displacement vol / avg lookback vol)
+    so order blocks can be ranked by institutional footprint strength.
     """
 
     def __init__(
@@ -119,13 +248,14 @@ class DisplacementScanner:
         self,
         bars: pd.DataFrame,
         current_idx: int,
-    ) -> Optional[Tuple[Direction, int]]:
+    ) -> Optional[Tuple[Direction, int, float]]:
         """
         Analyse bar at ``current_idx``.
 
-        Returns (direction, ob_candle_idx) if a displacement is detected,
+        Returns (direction, ob_candle_idx, volume_score) if a displacement is detected,
         where ob_candle_idx is the index of the order-block candle
-        (last opposite candle immediately before the displacement bar).
+        (last opposite candle immediately before the displacement bar),
+        and volume_score is the displacement candle's volume / avg lookback volume.
 
         Returns None if no displacement.
         """
@@ -151,6 +281,10 @@ class DisplacementScanner:
         if bar_range < self.threshold * avg_range:
             return None  # not a displacement candle
 
+        # Rev 3: compute volume score (displacement vol vs avg lookback vol)
+        avg_volume = valid["tick_volume"].mean()
+        volume_score = float(bar["tick_volume"]) / avg_volume if avg_volume > 0 else 1.0
+
         prior_high = window["high"].max()
         prior_low = window["low"].min()
 
@@ -158,13 +292,13 @@ class DisplacementScanner:
         if bar["close"] > prior_high:
             ob_idx = self._find_last_opposite_candle(bars, current_idx, bullish_move=True)
             if ob_idx is not None:
-                return (Direction.BEARISH, ob_idx)   # bearish OB (supply zone)
+                return (Direction.BEARISH, ob_idx, volume_score)   # bearish OB (supply zone)
 
         # Bearish displacement: close < prior low → demand OB (last bullish before move)
         elif bar["close"] < prior_low:
             ob_idx = self._find_last_opposite_candle(bars, current_idx, bullish_move=False)
             if ob_idx is not None:
-                return (Direction.BULLISH, ob_idx)   # bullish OB (demand zone)
+                return (Direction.BULLISH, ob_idx, volume_score)   # bullish OB (demand zone)
 
         return None
 
@@ -199,7 +333,7 @@ class OrderBlockRegister:
       - Max count per symbol (default 5)
       - Age-based expiry
       - Close-through invalidation
-      - Stacking/overlap merge
+      - Stacking/overlap merge (Rev 3: dominant by volume_score)
     """
 
     def __init__(
@@ -221,8 +355,8 @@ class OrderBlockRegister:
 
     def add(self, block: OrderBlock, avg_spread: float = 0.0) -> None:
         """
-        Add a new order block. Merges with any overlapping block, then
-        enforces the max-count cap (oldest is dropped if exceeded).
+        Add a new order block. Merges with any overlapping block (keeping the
+        highest volume_score), then enforces the max-count cap (oldest dropped).
         """
         tolerance = self.stack_tolerance_multiplier * avg_spread
 
@@ -232,13 +366,14 @@ class OrderBlockRegister:
                 existing_idx = self._blocks.index(existing)
                 merged = OrderBlock.merge(existing, block)
                 self._blocks[existing_idx] = merged
-                log.debug("Merged OBs into zone [%.5f, %.5f] for %s",
-                          merged.bottom, merged.top, self.symbol)
+                log.debug("Merged OBs into zone [%.5f, %.5f] for %s (vol_score=%.2f)",
+                          merged.bottom, merged.top, self.symbol, merged.volume_score)
                 return
 
         self._blocks.append(block)
-        log.debug("Registered new OB: %s %s [%.5f, %.5f] at bar %d",
-                  self.symbol, block.direction.name, block.bottom, block.top, block.birth_bar)
+        log.debug("Registered new OB: %s %s [%.5f, %.5f] bar=%d vol_score=%.2f",
+                  self.symbol, block.direction.name, block.bottom, block.top,
+                  block.birth_bar, block.volume_score)
 
         # Enforce max count: remove oldest if over limit
         active = self.active_blocks
@@ -303,8 +438,8 @@ class OrderBlockRegister:
             if self._is_rejection_close(block, bar):
                 confirmed.append(block)
                 block.active = False  # OB consumed — deactivate
-                log.debug("OB confirmed signal: %s [%.5f-%.5f]",
-                          block.direction.name, block.bottom, block.top)
+                log.debug("OB confirmed signal: %s [%.5f-%.5f] vol_score=%.2f",
+                          block.direction.name, block.bottom, block.top, block.volume_score)
         return confirmed
 
     def invalidate_direction(self, direction: Direction, from_bar: int) -> None:
@@ -358,6 +493,12 @@ class StrategyProcessor:
 
     Call ``process_bar(bar, bar_idx, avg_spread)`` on each incoming M1 bar.
     Returns a list of confirmed Signal objects (usually empty, occasionally one).
+
+    Rev 3 enhancements:
+      - Integrates FairValueGapScanner for FVG confluence detection
+      - Attaches volume_score and fvg_confluence to all emitted Signals
+      - Supports optional FVG filter: discard signals with no FVG confluence
+        when FVG_REQUIRE_CONFLUENCE=True in config
     """
 
     def __init__(
@@ -368,6 +509,7 @@ class StrategyProcessor:
     ) -> None:
         cfg = cfg or get_config()
         self.symbol = symbol
+        self._cfg = cfg
         self._register = OrderBlockRegister(
             symbol=symbol,
             max_age_bars=cfg.max_ob_age_bars,
@@ -378,8 +520,9 @@ class StrategyProcessor:
             displacement_threshold=cfg.displacement_threshold,
             zero_volume_bars=zero_volume_bars,
         )
+        self._fvg_scanner = FairValueGapScanner()
+
         # Rolling window — keep only what the scanner needs (lookback + 2 bars)
-        # Avoids O(n²) DataFrame rebuilds on large datasets
         from collections import deque
         _lookback = getattr(cfg, "displacement_lookback", 20)
         self._window_size = _lookback + 5
@@ -425,7 +568,7 @@ class StrategyProcessor:
             bars_df = pd.DataFrame(list(self._bar_deque)).reset_index(drop=True)
             result = self._scanner.scan(bars_df, len(bars_df) - 1)
             if result is not None:
-                direction, ob_idx = result
+                direction, ob_idx, volume_score = result
                 ob_bar = bars_df.iloc[ob_idx]
                 block = OrderBlock(
                     symbol=self.symbol,
@@ -433,6 +576,7 @@ class StrategyProcessor:
                     top=ob_bar["high"],
                     bottom=ob_bar["low"],
                     birth_bar=bar_idx,
+                    volume_score=volume_score,
                 )
                 # Invalidate older OBs in same direction (SDD 4.1.2)
                 self._register.invalidate_direction(direction, from_bar=bar_idx)
@@ -446,14 +590,43 @@ class StrategyProcessor:
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    @staticmethod
     def _build_signal(
+        self,
         block: OrderBlock,
         bar: pd.Series,
         bar_idx: int,
         spread: float,
     ) -> Signal:
+        """
+        Build a Signal from a confirmed OB. Computes FVG confluence and
+        quality score (volume_score boosted by FVG presence).
+        """
         entry = block.midpoint
+
+        # Rev 3: FVG confluence check (M1 only)
+        bars_df = pd.DataFrame(list(self._bar_deque)).reset_index(drop=True)
+        fvg_confluence = self._fvg_scanner.check_confluence(
+            block, bars_df, len(bars_df) - 1, lookback=20
+        )
+
+        # Quality score: normalise volume_score to 0–1, add FVG bonus
+        # volume_score is a ratio; cap at 3.0 to avoid outlier dominance
+        vol_component = min(block.volume_score / 3.0, 1.0)
+        fvg_bonus = 0.25 if fvg_confluence else 0.0
+        quality_score = min(vol_component * 0.75 + fvg_bonus, 1.0)
+
+        # Optional: require FVG confluence (controlled by config)
+        fvg_required = getattr(self._cfg, "fvg_require_confluence", False)
+        if fvg_required and not fvg_confluence:
+            log.debug(
+                "Signal rejected: FVG confluence required but absent [%.5f-%.5f]",
+                block.bottom, block.top,
+            )
+            # Return a placeholder signal that will be filtered by quality_score == 0
+            # We still return it so the backtest can optionally log it; the
+            # BacktestEngine/live bot should check quality_score > 0 before entering.
+            quality_score = 0.0
+
         return Signal(
             symbol=block.symbol,
             direction=block.direction,
@@ -463,4 +636,6 @@ class StrategyProcessor:
             confirmation_time=bar["time"],
             bar_index=bar_idx,
             spread_at_signal=spread,
+            fvg_confluence=fvg_confluence,
+            quality_score=quality_score,
         )

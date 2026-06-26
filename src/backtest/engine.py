@@ -8,6 +8,13 @@ Per SDD Rev 2, Section 6 & 6.1:
   - Fills at bid/ask midpoint + configurable slippage model
   - Vectorized pandas ops allowed ONLY within a single bar's context
 
+Rev 3 enhancements:
+  - Adaptive ATR-based SL: passes rolling ATR to create_exit_plan()
+  - Partial TP simulation: BacktestPosition tracks half_closed state;
+    on PARTIAL_TP the position is halved and SL moved to entry (free runner)
+  - Signal quality filter: signals below fvg_quality_threshold are skipped
+  - Session strength filter: entries skipped in low-volatility hours
+
 Architecture:
     BacktestEngine
       └── StrategyProcessor  (same as live)
@@ -25,6 +32,7 @@ import pandas as pd
 
 from src.core.logger import get_logger
 from src.data.market_data import compute_average_spread
+from src.data.atr_calculator import rolling_atr_pips   # Rev 3
 from src.execution.exit_manager import ExitManager, ExitPlan, ExitReason
 from src.strategy.order_block import StrategyProcessor
 from src.strategy.signal import Direction, Signal
@@ -41,7 +49,9 @@ class BacktestPosition:
     plan: ExitPlan
     entry_price: float
     entry_bar: int
-    current_sl: float    # may be updated by breakeven logic
+    current_sl: float       # may be updated by breakeven/trailing logic
+    half_closed: bool = False  # Rev 3: True after partial TP fired
+    position_fraction: float = 1.0  # Rev 3: remaining fraction (0.5 after partial TP)
 
 
 # ── BacktestTrade ─────────────────────────────────────────────────────────────
@@ -107,6 +117,16 @@ class BacktestEngine:
         trailing_stop_distance_pips: float = 0.0,
         session_start_utc: str = "00:00",
         session_end_utc: str = "23:59",
+        # Rev 3: ATR SL
+        use_atr_sl: bool = False,
+        atr_period: int = 14,
+        atr_sl_multiplier: float = 1.0,
+        # Rev 3: Partial TP
+        partial_tp_enabled: bool = False,
+        partial_tp_r: float = 1.0,
+        partial_tp_fraction: float = 0.5,
+        # Rev 3: Signal quality filter
+        fvg_quality_threshold: float = 0.0,
         cfg=None,
     ) -> None:
         self.symbol = symbol
@@ -114,6 +134,9 @@ class BacktestEngine:
         self.slippage_pips = slippage_pips
         self.pip_size = pip_size
         self.avg_spread_window = avg_spread_window
+        self.fvg_quality_threshold = fvg_quality_threshold  # Rev 3
+        self.use_atr_sl = use_atr_sl
+        self.atr_period = atr_period
 
         from datetime import datetime
         self.session_start = datetime.strptime(session_start_utc, "%H:%M").time()
@@ -127,6 +150,11 @@ class BacktestEngine:
             pip_size=pip_size,
             trailing_stop_activation_r=trailing_stop_activation_r,
             trailing_stop_distance_pips=trailing_stop_distance_pips,
+            use_atr_sl=use_atr_sl,
+            atr_sl_multiplier=atr_sl_multiplier,
+            partial_tp_enabled=partial_tp_enabled,
+            partial_tp_r=partial_tp_r,
+            partial_tp_fraction=partial_tp_fraction,
         )
 
         if cfg is not None:
@@ -136,16 +164,28 @@ class BacktestEngine:
             from src.strategy.order_block import OrderBlockRegister, DisplacementScanner, StrategyProcessor as SP
             self._processor = SP.__new__(SP)
             self._processor.symbol = symbol
+            self._processor._cfg = type('Cfg', (), {
+                'fvg_require_confluence': False,
+                'fvg_filter_enabled': True,
+            })()
             self._processor._register = OrderBlockRegister(
                 symbol, max_ob_age_bars, max_ob_per_symbol, ob_stack_tolerance
             )
             self._processor._scanner = DisplacementScanner(
                 displacement_threshold=displacement_threshold
             )
+            from src.strategy.order_block import FairValueGapScanner
+            self._processor._fvg_scanner = FairValueGapScanner()
             from collections import deque
             self._processor._window_size = 25
             self._processor._bar_deque = deque(maxlen=25)
             self._processor._pending_candidates = []
+
+        # Rev 3: Pre-compute rolling ATR for the full bar series
+        if use_atr_sl:
+            self._atr_series = rolling_atr_pips(self.bars, period=atr_period, pip_size=pip_size)
+        else:
+            self._atr_series = None
 
         self._open_positions: List[BacktestPosition] = []
         self._completed_trades: List[BacktestTrade] = []
@@ -187,11 +227,18 @@ class BacktestEngine:
                 if not in_session:
                     log.debug("Skipping signal at bar %d — outside session", bar_idx)
                     continue
+                # Rev 3: quality gate
+                if self.fvg_quality_threshold > 0 and sig.quality_score < self.fvg_quality_threshold:
+                    log.debug("Skipping signal at bar %d — quality %.2f < %.2f",
+                              bar_idx, sig.quality_score, self.fvg_quality_threshold)
+                    continue
                 if self._open_positions:
                     # Simplified: only 1 position at a time per symbol
                     log.debug("Skipping signal at bar %d — position already open", bar_idx)
                     continue
-                self._enter_position(sig, bar, bar_idx, avg_spread_pips)
+                # Rev 3: pass rolling ATR to entry
+                atr_pips = float(self._atr_series.iloc[bar_idx]) if self._atr_series is not None else 0.0
+                self._enter_position(sig, bar, bar_idx, avg_spread_pips, atr_pips=atr_pips)
 
         log.info("Backtest complete: %d trades", len(self._completed_trades))
         return BacktestReport(self._completed_trades, self.bars)
@@ -204,8 +251,9 @@ class BacktestEngine:
         bar: pd.Series,
         bar_idx: int,
         avg_spread_pips: float,
+        atr_pips: float = 0.0,          # Rev 3
     ) -> None:
-        """Simulate entry with slippage."""
+        """Simulate entry with slippage. Rev 3: passes ATR to exit plan."""
         slippage = self.slippage_pips * self.pip_size
         if signal.direction == Direction.BULLISH:
             entry_price = signal.entry_price + slippage   # filled at ask
@@ -218,6 +266,7 @@ class BacktestEngine:
             entry_price=entry_price,
             current_bar=bar_idx,
             current_spread_pips=spread_pips,
+            atr_pips=atr_pips,           # Rev 3
         )
         pos = BacktestPosition(
             signal=signal,
@@ -227,10 +276,13 @@ class BacktestEngine:
             current_sl=plan.stop_loss,
         )
         self._open_positions.append(pos)
-        log.debug("Entered %s at %.5f (bar %d)", signal.direction.name, entry_price, bar_idx)
+        log.debug("Entered %s at %.5f (bar %d) atr_pips=%.1f",
+                  signal.direction.name, entry_price, bar_idx, atr_pips)
 
     def _evaluate_open_positions(self, bar: pd.Series, bar_idx: int) -> None:
-        """Check all open positions for exit conditions on this bar."""
+        """Check all open positions for exit conditions on this bar.
+        Rev 3: handles PARTIAL_TP by halving position and moving SL to entry.
+        """
         still_open = []
         for pos in self._open_positions:
             reason, exit_price = self._exit_mgr.evaluate_bar(
@@ -240,12 +292,53 @@ class BacktestEngine:
                 # Move SL, keep position open
                 pos.current_sl = exit_price  # type: ignore[arg-type]
                 still_open.append(pos)
+            elif reason == ExitReason.PARTIAL_TP and not pos.half_closed:
+                # Rev 3: Partial close — record a partial trade, halve position, move SL to entry
+                partial_pnl = self._compute_partial_pnl(pos, exit_price, pos.plan.partial_tp_fraction)
+                partial_trade = self._build_partial_trade(pos, exit_price, bar_idx, partial_pnl)
+                self._completed_trades.append(partial_trade)
+                # Free runner: move SL to entry (risk-free)
+                pos.current_sl = pos.entry_price
+                pos.half_closed = True
+                pos.position_fraction = 1.0 - pos.plan.partial_tp_fraction
+                still_open.append(pos)
+                log.debug("Partial TP: %.1f pips on %.0f%% at bar %d",
+                          partial_pnl, pos.plan.partial_tp_fraction * 100, bar_idx)
             elif reason is not None and exit_price is not None:
                 trade = self._close_position(pos, exit_price, bar_idx, reason)
                 self._completed_trades.append(trade)
             else:
                 still_open.append(pos)
         self._open_positions = still_open
+
+    def _compute_partial_pnl(self, pos: BacktestPosition, exit_price: float, fraction: float) -> float:
+        """Compute P&L in pips for the partial close fraction."""
+        if pos.signal.direction == Direction.BULLISH:
+            return (exit_price - pos.entry_price) / self.pip_size * fraction
+        else:
+            return (pos.entry_price - exit_price) / self.pip_size * fraction
+
+    def _build_partial_trade(
+        self,
+        pos: BacktestPosition,
+        exit_price: float,
+        exit_bar: int,
+        pnl_pips: float,
+    ) -> "BacktestTrade":
+        """Build a BacktestTrade record for the partial close."""
+        return BacktestTrade(
+            symbol=self.symbol,
+            direction=pos.signal.direction,
+            entry_bar=pos.entry_bar,
+            exit_bar=exit_bar,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            stop_loss=pos.plan.stop_loss,
+            take_profit=pos.plan.partial_tp_price,
+            exit_reason=ExitReason.PARTIAL_TP,
+            risk_pips=pos.plan.risk_pips,
+            pnl_pips=pnl_pips,
+        )
 
     def _close_position(
         self,
